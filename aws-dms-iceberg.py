@@ -25,11 +25,11 @@ def getTableInfoFromSSM(ssm_param_table_values_key):
     return res
 
 # Read incoming data from Amazon S3
-def readS3DF(rawS3BucketName, rawBucketPrefix, schemaName, tableName):
+def readS3DF(rawS3BucketName, rawBucketPrefix, schemaName, tableName,source_database_name):
     inputDf = glueContext.create_dynamic_frame_from_options(
         connection_type = 's3', 
         connection_options = {
-            'paths': [f's3://{rawS3BucketName}/{rawBucketPrefix}/{schemaName}/{tableName}'], 
+            'paths': [f's3://{rawS3BucketName}/{rawBucketPrefix}/{source_database_name}/{schemaName}/{tableName}'], 
             'groupFiles': 'none', 
             'recurse':True
         }, 
@@ -142,7 +142,7 @@ import sys
 import os
 import json
 from pyspark.sql.session import SparkSession
-from pyspark.sql.functions import max
+from pyspark.sql.functions import max, lit
 from pyspark.sql.window import Window
 from awsglue.utils import getResolvedOptions
 from awsglue.context import GlueContext
@@ -151,6 +151,7 @@ from pyspark.sql import SparkSession
 import boto3
 from botocore.exceptions import ClientError
 from string import Template
+
 glueClient = boto3.client('glue')
 ssmClient = boto3.client('ssm')
 
@@ -164,6 +165,7 @@ rawS3BucketName = "mylott-test"
 rawBucketPrefix = "dms-raw"
 stageS3BucketName = "dms-stage"
 warehouse_path = f"s3://{rawS3BucketName}/iceberg_warehouse"
+source_database_name = 'triumphpay'
 
 #ssm_param_table_values = json.loads(ssmClient.get_parameter(Name = SSM_TABLE_PARAMETER_NAME)['Parameter']['Value'])
 
@@ -178,7 +180,12 @@ ssm_param_table_values = json.loads("""
         "primaryKey": "EventLogId",
         "domain": "triumphpay_iceberg",
         "partitionCols": ""
-    }
+    },
+    "dbo.PayeeRelationship": {
+        "primaryKey": "PayeeRelationshipId",
+        "domain": "triumphpay_iceberg",
+        "partitionCols": ""
+    }                                    
 }
 """)
 
@@ -228,15 +235,16 @@ for key in ssm_param_table_values:
             logger.info(f'***** {dbName}.{tableName} does not exist. Table will be created.')
 
     ## Read changes from raw bucket
-    inputDf = readS3DF(rawS3BucketName, rawBucketPrefix, schemaName, tableName)
-    
-
+    inputDf = readS3DF(rawS3BucketName, rawBucketPrefix, schemaName, tableName, source_database_name)
 
     if(inputDf.first() == None):
         logger.info('Dataframe is empty')
         continue;
     else:
         
+        if('Op' not in inputDf.columns):
+            inputDf.withColumn('Op', lit('I'))
+
         inputDf = inputDf.na.fill({'Op':'I'})
         if('Op' in inputDf.columns):
             # Dedup incoming changes
