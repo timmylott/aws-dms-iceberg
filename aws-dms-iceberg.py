@@ -44,9 +44,17 @@ def dedupCDCRecords(inputDf, keylist):
     IDWindowDF = Window.partitionBy(*keylist).orderBy(inputDf.last_update_time).rangeBetween(-sys.maxsize, sys.maxsize)
     inputDFWithTS = inputDf.withColumn('max_op_date', max(inputDf.last_update_time).over(IDWindowDF))
     
-    NewInsertsDF = inputDFWithTS.filter('last_update_time=max_op_date').filter("op='I'")
-    UpdateDeleteDf = inputDFWithTS.filter('last_update_time=max_op_date').filter("op IN ('U','D')")
-    finalInputDF = NewInsertsDF.unionAll(UpdateDeleteDf)
+    #NewInsertsDF = inputDFWithTS.filter('last_update_time=max_op_date').filter("op='I'")
+    #UpdateDeleteDf = inputDFWithTS.filter('last_update_time=max_op_date').filter("op IN ('U','D')")
+    #finalInputDF = NewInsertsDF.unionAll(UpdateDeleteDf)
+
+    ## what if there was and insert and an update in for a record in the same set of cdc records
+    ## don't we just want the most recent action/operration for a record?
+    ## then in the merge when upsetting we handle it there.
+    ## an I then U, we would have U in DF, then merge would be when not matched and op = U then insert
+    ## and I then U and D, we would have D, then merge would be on matched and op=D then D if it was never inserted do we care?
+
+    finalInputDF = inputDFWithTS.filter('last_update_time=max_op_date')
 
     return finalInputDF
 
@@ -100,7 +108,7 @@ def upsertRecordsSparkSQL(finalInputDF, inputDfWithoutControlColumns_columns, sc
         ON $primary_key_condition
         WHEN MATCHED AND source.Op = 'D' THEN DELETE
         WHEN MATCHED AND source.Op in ('U', 'I') THEN UPDATE SET $updateTableColumnList
-        WHEN NOT MATCHED and source.Op = 'I' THEN INSERT ($tableColumns) values ($insertTableColumnList)
+        WHEN NOT MATCHED and source.Op in ('U', 'I') THEN INSERT ($tableColumns) values ($insertTableColumnList)
     """)
     SQLQUERY = sqltemp.substitute(
         catalog_name = catalog_name, 
@@ -111,28 +119,6 @@ def upsertRecordsSparkSQL(finalInputDF, inputDfWithoutControlColumns_columns, sc
         updateTableColumnList = updateTableColumnList[ : -1], 
         tableColumns = tableColumns, 
         insertTableColumnList = insertTableColumnList[ : -1])
-
-    logger.info(f'****SQL QUERY IS : {SQLQUERY}')
-    spark.sql(SQLQUERY)
-
-# Perform initial data loading into an empty Iceberg table
-def initialLoadRecordsSparkSQL(finalInputDF, inputDfWithoutControlColumns_columns, schemaName):
-    finalInputDF.createOrReplaceTempView('insertTable')
-    insertTableColumnList = ''
-    for column in inputDfWithoutControlColumns_columns:
-        insertTableColumnList += f" {column},"
-
-    logger.info('***** Inserting initial data')
-    sqltemp = Template("""
-        INSERT INTO $catalog_name.$dbName.$tableName  ($insertTableColumnList)
-        SELECT $insertTableColumnList FROM insertTable $partitionStrSQL
-    """)
-    SQLQUERY = sqltemp.substitute(
-        catalog_name = catalog_name, 
-        dbName = dbName, 
-        tableName = f'{schemaName}_{tableName.lower()}',
-        insertTableColumnList = insertTableColumnList[ : -1],
-        partitionStrSQL = partitionStrSQL)
 
     logger.info(f'****SQL QUERY IS : {SQLQUERY}')
     spark.sql(SQLQUERY)
@@ -244,13 +230,11 @@ for key in ssm_param_table_values:
         
         if('Op' not in inputDf.columns):
             inputDf.withColumn('Op', lit('I'))
-
-        inputDf = inputDf.na.fill({'Op':'I'})
-        if('Op' in inputDf.columns):
-            # Dedup incoming changes
-            finalInputDF = dedupCDCRecords(inputDf, keylist)
         else:
-            finalInputDF = inputDf
+            inputDf = inputDf.na.fill({'Op':'I'})
+            
+        finalInputDF = dedupCDCRecords(inputDf, keylist)
+
 
         inputDfWithoutControlColumns = finalInputDF.drop(*dropColumnList)
         tableColumns = ','.join(inputDfWithoutControlColumns.columns)
@@ -259,12 +243,8 @@ for key in ssm_param_table_values:
                 ## Create table if not exists
                 createTableSparkSQL(stageS3BucketName, dbName, tableName, tableColumns, partitionStrSQL, rawS3BucketName, schemaName)
 
-            if('Op' in inputDf.columns):
-                # Upsert changes
-                upsertRecordsSparkSQL(finalInputDF, inputDfWithoutControlColumns.columns, schemaName)
-            else:  
-                # Perform initial data loading
-                initialLoadRecordsSparkSQL(finalInputDF, inputDfWithoutControlColumns.columns, schemaName)
+            # Upsert changes
+            upsertRecordsSparkSQL(finalInputDF, inputDfWithoutControlColumns.columns, schemaName)
         
         except Exception as e:
             # Log errors and save table into error array            
